@@ -1,0 +1,59 @@
+name: Sync Upstream & Release
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:        # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream --tags --force
+          git fetch origin --tags --force
+
+      - name: Sync main branch
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit || true
+          git push origin main
+
+      - name: Push new tags and trigger release
+        run: |
+          # Find upstream tags not yet in origin
+          UPSTREAM_TAGS=$(git tag -l --sort=-version:refname)
+          NEW_TAGS=""
+
+          for tag in $UPSTREAM_TAGS; do
+            # Check if this tag exists on origin
+            if ! git ls-remote --tags origin "$tag" | grep -q "$tag"; then
+              NEW_TAGS="$NEW_TAGS $tag"
+            fi
+          done
+
+          if [ -z "$NEW_TAGS" ]; then
+            echo "No new tags to sync."
+          else
+            for tag in $NEW_TAGS; do
+              echo "Pushing new tag: $tag"
+              git push origin "$tag"
+            done
+          fi
