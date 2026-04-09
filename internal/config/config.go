@@ -126,6 +126,11 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// ShortSystem controls the antigravity system instruction mode.
+	// true (default): minimal identity + user prompt only.
+	// false: full identity + ignore wrapper + user system parts appended.
+	ShortSystem *bool `yaml:"short-system,omitempty" json:"short-system,omitempty"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
