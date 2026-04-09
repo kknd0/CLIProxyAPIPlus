@@ -1,0 +1,103 @@
+name: Sync Upstream & Release
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:        # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream --tags --force
+          git fetch origin --tags --force
+
+      - name: Sync main branch
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit || true
+          git push origin main
+
+      - name: Find latest upstream tag and determine fork tag
+        id: check_tag
+        run: |
+          # Get the latest tag from upstream by version sort
+          LATEST_UPSTREAM=$(git tag -l 'v*' --sort=-version:refname | grep -v '\-fork' | head -1)
+          FORK_TAG="${LATEST_UPSTREAM}-fork"
+          echo "latest_tag=$LATEST_UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=$FORK_TAG" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have a release for this fork tag
+          REPO="${{ github.repository }}"
+          ASSET_COUNT=$(gh api "repos/$REPO/releases/tags/$FORK_TAG" --jq '.assets | length' 2>/dev/null || echo "0")
+          if [ "$ASSET_COUNT" -gt "0" ]; then
+            echo "Release $FORK_TAG already has $ASSET_COUNT assets, skipping."
+            echo "need_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release needed for $FORK_TAG (assets: $ASSET_COUNT)"
+            echo "need_release=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push fork tag
+        if: steps.check_tag.outputs.need_release == 'true'
+        run: |
+          FORK_TAG="${{ steps.check_tag.outputs.fork_tag }}"
+          git tag -f "$FORK_TAG" main
+          git push origin "$FORK_TAG" --force
+
+      - uses: actions/setup-go@v4
+        if: steps.check_tag.outputs.need_release == 'true'
+        with:
+          go-version: '>=1.26.0'
+          cache: true
+
+      - name: Checkout main (includes custom changes)
+        if: steps.check_tag.outputs.need_release == 'true'
+        run: git checkout main
+
+      - name: Refresh models catalog
+        if: steps.check_tag.outputs.need_release == 'true'
+        run: |
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+
+      - name: Generate Build Metadata
+        if: steps.check_tag.outputs.need_release == 'true'
+        run: |
+          echo "VERSION=${{ steps.check_tag.outputs.fork_tag }}" >> $GITHUB_ENV
+          echo COMMIT=$(git rev-parse --short HEAD) >> $GITHUB_ENV
+          echo BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) >> $GITHUB_ENV
+
+      - name: Run GoReleaser
+        if: steps.check_tag.outputs.need_release == 'true'
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.check_tag.outputs.fork_tag }}
+          VERSION: ${{ env.VERSION }}
+          COMMIT: ${{ env.COMMIT }}
+          BUILD_DATE: ${{ env.BUILD_DATE }}
