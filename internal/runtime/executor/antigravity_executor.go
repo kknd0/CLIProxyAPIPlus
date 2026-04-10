@@ -599,6 +599,14 @@ attemptLoop:
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
 				lastErr = nil
+				// Short RATE_LIMIT_EXCEEDED: wait the indicated delay and retry immediately
+				if delay, ok := antigravityShortRateLimitDelay(httpResp.StatusCode, bodyBytes); ok && attempt+1 < attempts {
+					log.Debugf("antigravity executor: short rate-limit for model %s, waiting %s then retrying (attempt %d/%d)", baseModel, delay, attempt+1, attempts)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return resp, errWait
+					}
+					continue attemptLoop
+				}
 				if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
@@ -774,6 +782,14 @@ attemptLoop:
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
 				lastErr = nil
+				// Short RATE_LIMIT_EXCEEDED: wait the indicated delay and retry immediately
+				if delay, ok := antigravityShortRateLimitDelay(httpResp.StatusCode, bodyBytes); ok && attempt+1 < attempts {
+					log.Debugf("antigravity executor: short rate-limit for model %s, waiting %s then retrying (attempt %d/%d)", baseModel, delay, attempt+1, attempts)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return resp, errWait
+					}
+					continue attemptLoop
+				}
 				if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
@@ -1198,6 +1214,14 @@ attemptLoop:
 				lastStatus = httpResp.StatusCode
 				lastBody = append([]byte(nil), bodyBytes...)
 				lastErr = nil
+				// Short RATE_LIMIT_EXCEEDED: wait the indicated delay and retry immediately
+				if delay, ok := antigravityShortRateLimitDelay(httpResp.StatusCode, bodyBytes); ok && attempt+1 < attempts {
+					log.Debugf("antigravity executor: short rate-limit for model %s, waiting %s then retrying (attempt %d/%d)", baseModel, delay, attempt+1, attempts)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return nil, errWait
+					}
+					continue attemptLoop
+				}
 				if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
@@ -1842,6 +1866,43 @@ func antigravityShouldRetryTransientResourceExhausted429(statusCode int, body []
 	}
 	msg := strings.ToLower(string(body))
 	return strings.Contains(msg, "resource has been exhausted")
+}
+
+// antigravityShortRateLimitDelay checks if a 429 response is a RATE_LIMIT_EXCEEDED
+// with a short quotaResetDelay (< 10s). If so, it returns the delay to wait before
+// retrying. This avoids treating brief rate-limit windows as hard failures.
+func antigravityShortRateLimitDelay(statusCode int, body []byte) (time.Duration, bool) {
+	if statusCode != http.StatusTooManyRequests {
+		return 0, false
+	}
+	if classifyAntigravity429(body) != antigravity429RateLimited {
+		return 0, false
+	}
+	// Parse the retryDelay from the RetryInfo detail
+	if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+		if *retryAfter > 0 && *retryAfter <= 10*time.Second {
+			// Add a small buffer to avoid hitting the exact boundary
+			return *retryAfter + 500*time.Millisecond, true
+		}
+	}
+	// Also try parsing quotaResetDelay from metadata
+	details := gjson.GetBytes(body, "error.details")
+	if details.Exists() && details.IsArray() {
+		for _, detail := range details.Array() {
+			if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
+				continue
+			}
+			delayStr := strings.TrimSpace(detail.Get("metadata.quotaResetDelay").String())
+			if delayStr == "" || delayStr == "0s" {
+				// Zero delay means ready now, use a minimal wait
+				return 1 * time.Second, true
+			}
+			if d, err := time.ParseDuration(delayStr); err == nil && d > 0 && d <= 10*time.Second {
+				return d + 500*time.Millisecond, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func antigravityNoCapacityRetryDelay(attempt int) time.Duration {
